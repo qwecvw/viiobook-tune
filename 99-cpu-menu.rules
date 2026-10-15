@@ -1,0 +1,2 @@
+# TLP (85-tlp.rules) re-applies its profile on charger plug/unplug; restore the user profile after it.
+ACTION=="change", SUBSYSTEM=="power_supply", KERNEL!="hidpp_battery*", RUN+="/usr/local/bin/cpu-tune apply"

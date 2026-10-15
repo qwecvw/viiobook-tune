@@ -1,0 +1,326 @@
+#!/bin/sh
+# Root helper for cpu-menu: tweak CPU/GPU power settings.
+#   cpu-tune max <kHz>        cap max frequency
+#   cpu-tune min <kHz>        raise min frequency
+#   cpu-tune boost 0|1        disable/enable Core Performance Boost (only if the driver has it)
+#   cpu-tune governor <name>  set scaling governor
+#   cpu-tune epp <pref>       amd_pstate energy/performance preference (governor powersave)
+#   cpu-tune online <n> 0|1   put CPU n to sleep (offline) / wake it (cpu0 always stays on)
+#   cpu-tune profile quiet|balanced|performance   ASUS fan/power profile (platform_profile)
+#   cpu-tune fanmax <°C>|off  user mode: run the fan at full speed from this CPU temperature
+#                             (cpu-fan-guard service; below it the firmware fan curve rules)
+#   cpu-tune fancap <rpm>|off user mode: keep the fan under this speed by lowering the CPU power
+#                             limit (cpu-fan-guard service; the firmware has no rpm limit)
+#   cpu-tune nvoc <core> <mem>  user mode: NVIDIA clock offsets in MHz (nv-oc); applied now if the
+#                             GPU is awake, else by cpu-fan-guard when it wakes (offsets die in sleep)
+#   cpu-tune power <W>|off    user mode: CPU package power limit (STAPM/fast/slow PPT) via ryzenadj;
+#                             off = firmware limits. Curve Optimizer undervolt is rejected by this SMU.
+#                             The firmware sets its own limits per platform profile and AC/battery
+#                             (e.g. quiet on battery = 25 W), so "off" re-applies the profile.
+#   cpu-tune mode user|lab    switch to a custom profile (/etc/cpu-menu/<mode>/); "user on" = "mode user"
+#                             lab = experiments: wider limits + hw-lab watchdog/telemetry service
+#   cpu-tune apply            re-apply the custom profile if one is active (boot, charger events)
+#   cpu-tune reset            leave custom mode: all CPUs online, min/max back to hardware limits
+#   cpu-tune amdgpu auto|low|high   AMD iGPU performance level
+#   cpu-tune nvclock <MHz>|reset    cap NVIDIA graphics clock (nvidia-smi -lgc)
+#   cpu-tune prime on-demand|intel  use NVIDIA on demand / never (applies after reboot)
+# In a custom mode every CPU change is also saved to its profile, so it survives reboots
+# and TLP re-applying its settings when the charger is plugged/unplugged.
+# Runs via sudo (see /etc/sudoers.d/cpu-tune), so every argument is validated.
+set -e
+cpu=/sys/devices/system/cpu
+conf=/etc/cpu-menu
+[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+
+profile=/sys/firmware/acpi/platform_profile
+
+is_num() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; }
+mode=$(cat $conf/mode 2>/dev/null || true)
+is_user() { [ "$mode" = user ] || [ "$mode" = lab ]; }  # any custom profile
+pdir=$conf/$mode  # profile dir of the active custom mode
+
+# Limits per custom mode: lab may go past the firmware values (the hw-lab watchdog guards it)
+if [ "$mode" = lab ]; then MAX_W=60; MAX_CORE=1000; MAX_MEM=6000
+else MAX_W=""; MAX_CORE=300; MAX_MEM=2000
+fi
+
+# One-time move of the old flat layout (/etc/cpu-menu/user.conf, power, ...) into user/
+if [ -f $conf/user.conf ] && [ ! -d $conf/user ]; then
+  mkdir -p $conf/user
+  mv $conf/user.conf $conf/user/profile.conf
+  for f in power fancap fanmax nvoc; do if [ -f $conf/$f ]; then mv $conf/$f $conf/user/; fi; done
+fi
+
+is_online() { # n
+  [ ! -f $cpu/cpu$1/online ] || [ "$(cat $cpu/cpu$1/online)" = 1 ]
+}
+
+set_all() { # file value -- online CPUs only, offline ones have no active policy
+  for d in $cpu/cpu[0-9]*; do
+    n=${d##*/cpu}
+    if is_online "$n"; then echo "$2" > "$d/cpufreq/$1"; fi
+  done
+}
+
+set_range() { # min max
+  set_all scaling_max_freq "$(cat $cpu/cpu0/cpufreq/cpuinfo_max_freq)"
+  set_all scaling_min_freq "$1"
+  set_all scaling_max_freq "$2"
+}
+
+online_all() {
+  for f in $cpu/cpu[0-9]*/online; do
+    if [ "$(cat "$f")" = 0 ]; then echo 1 > "$f"; fi
+  done
+}
+
+has_governor() { # name
+  case " $(cat $cpu/cpu0/cpufreq/scaling_available_governors) " in *" $1 "*) return 0 ;; esac
+  return 1
+}
+
+save_user() { # snapshot the current CPU state as the active custom profile
+  mkdir -p $pdir
+  off=""
+  for f in $cpu/cpu[0-9]*/online; do
+    if [ "$(cat "$f")" = 0 ]; then n=${f%/online}; off="$off ${n##*/cpu}"; fi
+  done
+  cat > $pdir/profile.conf <<EOF
+MIN=$(cat $cpu/cpu0/cpufreq/scaling_min_freq)
+MAX=$(cat $cpu/cpu0/cpufreq/scaling_max_freq)
+BOOST=$(cat $cpu/cpufreq/boost 2>/dev/null)
+GOVERNOR=$(cat $cpu/cpu0/cpufreq/scaling_governor)
+EPP=$(cat $cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null)
+PROFILE=$(cat $profile 2>/dev/null)
+OFFLINE="${off# }"
+EOF
+}
+
+nv_awake() { # NVIDIA driver loaded and the GPU powered: NVML calls won't wake it up
+  [ -d /sys/module/nvidia ] || return 1
+  for d in /sys/bus/pci/devices/*; do
+    if [ "$(cat $d/vendor)" = 0x10de ] && [ "$(cut -c1-4 $d/class)" = 0x03 ]; then
+      [ "$(cat $d/power/runtime_status)" = active ]; return
+    fi
+  done
+  return 1
+}
+
+nv_set() { # core mem
+  nv-oc set "$1" "$2"
+  mkdir -p /run/cpu-menu
+  if [ "$1 $2" = "0 0" ]; then rm -f /run/cpu-menu/nvoc-applied; else echo "$1 $2" > /run/cpu-menu/nvoc-applied; fi
+}
+
+ryzenadj_run() { # args... -- quiet on success, short error otherwise
+  out=$(ryzenadj "$@" 2>&1) || {
+    echo "$out" | grep -vE '^SMU_SERVICE|ryzen_smu' | tail -2; exit 1; }
+}
+
+power_stock() { # remember the firmware limits (mW) once: fallback for "off" and the upper bound
+  [ -f $conf/power-stock ] && return
+  mkdir -p $conf
+  ryzenadj -i 2>/dev/null | awk -F'|' '
+    $2 ~ /STAPM LIMIT/    { printf "STAPM=%d\n", $3 * 1000 }
+    $2 ~ /PPT LIMIT FAST/ { printf "FAST=%d\n",  $3 * 1000 }
+    $2 ~ /PPT LIMIT SLOW/ { printf "SLOW=%d\n",  $3 * 1000 }' > $conf/power-stock
+  grep -q '^STAPM=[1-9]' $conf/power-stock || { rm -f $conf/power-stock; echo "cannot read stock limits"; exit 1; }
+}
+
+set_power() { # W|off
+  power_stock
+  . $conf/power-stock
+  if [ "$1" = off ]; then
+    # Writing the platform profile makes the firmware load its own limits for it
+    if [ -f $profile ]; then p=$(cat $profile); echo "$p" > $profile
+    else ryzenadj_run --stapm-limit=$STAPM --fast-limit=$FAST --slow-limit=$SLOW
+    fi
+  else
+    mw=$(($1 * 1000))
+    top=$FAST; [ -z "$MAX_W" ] || top=$((MAX_W * 1000))
+    [ $mw -le $top ] || { echo "max $((top / 1000)) W in $mode mode"; exit 1; }
+    ryzenadj_run --stapm-limit=$mw --fast-limit=$mw --slow-limit=$mw
+  fi
+}
+
+apply_user() {
+  BOOST="" EPP="" PROFILE=""
+  . $pdir/profile.conf
+  if [ -n "$PROFILE" ] && [ -f $profile ]; then echo "$PROFILE" > $profile; fi
+  online_all  # configure every CPU first, then put the chosen ones to sleep
+  # A profile saved under another driver (acpi-cpufreq vs amd_pstate) may name a missing governor
+  has_governor "$GOVERNOR" || GOVERNOR=powersave
+  has_governor "$GOVERNOR" || GOVERNOR=$(cat $cpu/cpu0/cpufreq/scaling_governor)
+  set_all scaling_governor "$GOVERNOR"
+  if [ -n "$BOOST" ] && [ -f $cpu/cpufreq/boost ]; then echo "$BOOST" > $cpu/cpufreq/boost; fi
+  if [ -n "$EPP" ] && [ "$GOVERNOR" = powersave ] && [ -f $cpu/cpu0/cpufreq/energy_performance_preference ]; then
+    set_all energy_performance_preference "$EPP"
+  fi
+  hw_min=$(cat $cpu/cpu0/cpufreq/cpuinfo_min_freq)
+  hw_max=$(cat $cpu/cpu0/cpufreq/cpuinfo_max_freq)
+  [ "$MIN" -ge "$hw_min" ] || MIN=$hw_min
+  [ "$MAX" -le "$hw_max" ] || MAX=$hw_max
+  set_range "$MIN" "$MAX"
+  for n in $OFFLINE; do echo 0 > $cpu/cpu$n/online; done
+  pw=$(cat $pdir/power 2>/dev/null || echo off)
+  if [ "$pw" != off ] && command -v ryzenadj >/dev/null; then set_power "$pw"; fi
+  if nv_awake; then  # offsets of this profile (cpu-fan-guard does it when the GPU wakes later)
+    # shellcheck disable=SC2046
+    nv_set $(cat $pdir/nvoc 2>/dev/null || echo 0 0)
+  fi
+}
+
+case "$1" in
+  max|min)
+    is_num "$2" || { echo "bad frequency: $2"; exit 1; }
+    hw_min=$(cat $cpu/cpu0/cpufreq/cpuinfo_min_freq)
+    hw_max=$(cat $cpu/cpu0/cpufreq/cpuinfo_max_freq)
+    [ "$2" -ge "$hw_min" ] && [ "$2" -le "$hw_max" ] || { echo "out of range $hw_min..$hw_max"; exit 1; }
+    lo=$(cat $cpu/cpu0/cpufreq/scaling_min_freq)
+    hi=$(cat $cpu/cpu0/cpufreq/scaling_max_freq)
+    if [ "$1" = max ]; then
+      [ "$lo" -gt "$2" ] && lo=$2
+      set_range "$lo" "$2"
+    else
+      [ "$hi" -lt "$2" ] && hi=$2
+      set_range "$2" "$hi"
+    fi
+    ;;
+  boost)
+    [ -f $cpu/cpufreq/boost ] || { echo "no boost control with this driver, use max freq"; exit 1; }
+    case "$2" in 0|1) echo "$2" > $cpu/cpufreq/boost ;; *) echo "boost 0|1"; exit 1 ;; esac
+    ;;
+  governor)
+    has_governor "$2" || { echo "unknown governor: $2"; exit 1; }
+    set_all scaling_governor "$2"
+    ;;
+  epp)
+    f=$cpu/cpu0/cpufreq/energy_performance_preference
+    [ -f $f ] || { echo "no EPP with this driver"; exit 1; }
+    # Validate against the full list: with governor performance the driver offers only "performance"
+    case "$2" in performance|balance_performance|balance_power|power) ;; *) echo "unknown EPP: $2"; exit 1 ;; esac
+    # EPP is locked to "performance" under the performance governor: switch to powersave first
+    if [ "$(cat $cpu/cpu0/cpufreq/scaling_governor)" != powersave ]; then
+      [ "$2" = performance ] && exit 0
+      set_all scaling_governor powersave
+    fi
+    set_all energy_performance_preference "$2"
+    ;;
+  online)
+    is_num "$2" && [ "$2" -gt 0 ] && [ -f $cpu/cpu$2/online ] || { echo "bad cpu: $2"; exit 1; }
+    case "$3" in
+      0) echo 0 > $cpu/cpu$2/online ;;
+      1)
+        echo 1 > $cpu/cpu$2/online
+        # A woken CPU keeps its old policy: copy cpu0's current settings to it
+        f=$cpu/cpu$2/cpufreq
+        cat $cpu/cpu0/cpufreq/scaling_governor > $f/scaling_governor
+        cat $cpu/cpu0/cpufreq/cpuinfo_max_freq > $f/scaling_max_freq
+        cat $cpu/cpu0/cpufreq/scaling_min_freq > $f/scaling_min_freq
+        cat $cpu/cpu0/cpufreq/scaling_max_freq > $f/scaling_max_freq
+        ;;
+      *) echo "online <n> 0|1"; exit 1 ;;
+    esac
+    ;;
+  profile)
+    [ -f $profile ] || { echo "no platform_profile"; exit 1; }
+    case " $(cat ${profile}_choices) " in *" $2 "*) ;; *) echo "unknown profile: $2"; exit 1 ;; esac
+    echo "$2" > $profile
+    # The firmware just loaded the profile's own power limits: put the user limit back on top
+    pw=$(cat $pdir/power 2>/dev/null || echo off)
+    if is_user && [ "$pw" != off ] && command -v ryzenadj >/dev/null; then set_power "$pw"; fi
+    ;;
+  fanmax)
+    is_user || { echo "fan settings work in user/lab mode"; exit 1; }
+    mkdir -p $pdir
+    if [ "$2" = off ]; then rm -f $pdir/fanmax
+    elif is_num "$2" && [ "$2" -ge 35 ] && [ "$2" -le 95 ]; then
+      echo "$2" > $pdir/fanmax; rm -f $pdir/fancap  # full speed and an rpm cap contradict
+    else echo "fanmax 35..95|off"; exit 1
+    fi
+    exit 0
+    ;;
+  fancap)
+    is_user || { echo "fan settings work in user/lab mode"; exit 1; }
+    mkdir -p $pdir
+    if [ "$2" = off ]; then rm -f $pdir/fancap
+    elif is_num "$2" && [ "$2" -ge 1500 ] && [ "$2" -le 7000 ]; then
+      echo "$2" > $pdir/fancap; rm -f $pdir/fanmax
+    else echo "fancap 1500..7000|off"; exit 1
+    fi
+    exit 0
+    ;;
+  user|mode)
+    new=$2; [ "$1 $2" = "user on" ] && new=user
+    case "$new" in user|lab) ;; *) echo "mode user|lab"; exit 1 ;; esac
+    # Coming from the other custom mode: drop its power limit first (the new profile may have none)
+    if is_user && [ "$(cat $pdir/power 2>/dev/null || echo off)" != off ]; then set_power off; fi
+    mode=$new; pdir=$conf/$mode
+    mkdir -p $pdir
+    [ -f $pdir/profile.conf ] || save_user  # first time: start from the current state
+    echo $mode > $conf/mode
+    if [ $mode = lab ]; then MAX_W=60; else MAX_W=""; fi
+    apply_user
+    if [ $mode = lab ]; then systemctl start hw-lab.service; else systemctl stop hw-lab.service 2>/dev/null || true; fi
+    exit 0
+    ;;
+  nvoc)
+    is_user || { echo "GPU overclock works in user/lab mode"; exit 1; }
+    is_num "$2" && is_num "$3" && [ "$2" -le $MAX_CORE ] && [ "$3" -le $MAX_MEM ] ||
+      { echo "nvoc <core 0..$MAX_CORE> <mem 0..$MAX_MEM> in $mode mode"; exit 1; }
+    mkdir -p $pdir
+    echo "$2 $3" > $pdir/nvoc
+    if nv_awake; then nv_set "$2" "$3"; fi
+    exit 0
+    ;;
+  power)
+    [ "$2" = off ] || { is_num "$2" && [ "$2" -ge 5 ]; } || { echo "power <W>|off"; exit 1; }
+    command -v ryzenadj >/dev/null || { echo "ryzenadj not installed"; exit 1; }
+    is_user || { echo "power limit works in user/lab mode"; exit 1; }
+    set_power "$2"
+    echo "$2" > $pdir/power
+    exit 0
+    ;;
+  apply)
+    if is_user; then apply_user; fi
+    if [ "$mode" = lab ]; then systemctl start hw-lab.service; fi
+    exit 0
+    ;;
+  reset)
+    rm -f $conf/mode
+    systemctl stop hw-lab.service 2>/dev/null || true
+    # Leaving user mode drops the GPU overclock (if the GPU sleeps, cpu-fan-guard does it on wake)
+    if [ -f /run/cpu-menu/nvoc-applied ] && nv_awake; then nv_set 0 0; fi
+    # Leaving user mode restores stock power limits (the saved value stays for the next user mode)
+    if [ "$(cat $pdir/power 2>/dev/null || echo off)" != off ] && [ -f $conf/power-stock ]; then set_power off; fi
+    if [ -f $profile ]; then echo balanced > $profile; fi
+    online_all
+    set_all scaling_governor "$(cat $cpu/cpu0/cpufreq/scaling_governor)"
+    set_range "$(cat $cpu/cpu0/cpufreq/cpuinfo_min_freq)" "$(cat $cpu/cpu0/cpufreq/cpuinfo_max_freq)"
+    exit 0
+    ;;
+  amdgpu)
+    case "$2" in auto|low|high) ;; *) echo "amdgpu auto|low|high"; exit 1 ;; esac
+    for c in /sys/class/drm/card[0-9]*; do
+      if [ "$(basename "$(readlink -f $c/device/driver)")" = amdgpu ]; then
+        echo "$2" > $c/device/power_dpm_force_performance_level
+      fi
+    done
+    exit 0
+    ;;
+  nvclock)
+    if [ "$2" = reset ]; then nvidia-smi -rgc
+    elif is_num "$2"; then nvidia-smi -lgc "0,$2"
+    else echo "nvclock <MHz>|reset"; exit 1
+    fi
+    exit 0
+    ;;
+  prime)
+    case "$2" in on-demand|intel) prime-select "$2" ;; *) echo "prime on-demand|intel"; exit 1 ;; esac
+    exit 0
+    ;;
+  *) echo "usage: cpu-tune max|min <kHz> | boost 0|1 | governor <name> | epp <pref> | online <n> 0|1 | profile <name> | fanmax <°C>|off | fancap <rpm>|off | nvoc <core> <mem> | power <W>|off | mode user|lab | apply | reset | amdgpu <level> | nvclock <MHz>|reset | prime on-demand|intel"; exit 1 ;;
+esac
+
+# CPU setting changed: in user mode remember it
+if is_user; then save_user; fi

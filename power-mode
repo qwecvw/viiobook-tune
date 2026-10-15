@@ -1,0 +1,35 @@
+#!/bin/sh
+# Switch between TLP profiles: perf | save | auto | user | lab | status
+# user/lab = TLP profile for the current power source + saved custom profile from cpu-menu;
+# lab also starts the hw-lab watchdog + telemetry (experiments past the firmware limits).
+# Switching a profile first drops manual settings from cpu-menu (all cores on, full range),
+# then TLP applies its own profile on top.
+set -e
+cpu=/sys/devices/system/cpu
+case "$1" in
+  perf) sudo cpu-tune reset; sudo tlp ac ;;
+  save)
+    sudo cpu-tune reset; sudo tlp bat
+    [ "$(prime-select query 2>/dev/null)" = nvidia ] &&
+      echo "Hint: NVIDIA GPU is always on. For battery run: sudo prime-select on-demand (then re-login)."
+    ;;
+  auto) sudo cpu-tune reset; sudo tlp start ;;
+  user|lab) sudo tlp start; sudo cpu-tune mode "$1" ;;
+  status|"")
+    echo "governor: $(cat $cpu/cpu0/cpufreq/scaling_governor)"
+    echo "boost:    $(cat $cpu/cpufreq/boost 2>/dev/null || echo "n/a (amd_pstate: via max freq)")"
+    echo "epp:      $(cat $cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null || echo n/a)"
+    m=$(cat /etc/cpu-menu/mode 2>/dev/null || true)
+    if [ "$m" = user ] || [ "$m" = lab ]; then echo "mode:     $m"
+    else echo "mode:     $(case "$(cat /run/tlp/last_pwr 2>/dev/null)" in 0) echo perf ;; 1) echo save ;; *) echo unknown ;; esac)"
+    fi
+    echo "offline:  $(grep -l 0 $cpu/cpu*/online 2>/dev/null | sed 's|.*/cpu\([0-9]*\)/online|\1|' | tr '\n' ' ')"
+    echo "max freq: $(($(cat $cpu/cpu0/cpufreq/scaling_max_freq) / 1000)) MHz"
+    echo "min freq: $(($(cat $cpu/cpu0/cpufreq/scaling_min_freq) / 1000)) MHz"
+    echo "cur freq: $(awk '/MHz/{s+=$4;n++} END{printf "%d", s/n}' /proc/cpuinfo) MHz avg"
+    echo "gpu mode: $(prime-select query 2>/dev/null || echo n/a)"
+    b=/sys/class/power_supply/BAT0
+    echo "battery:  $(cat $b/capacity)% $(cat $b/status), limit $(cat $b/charge_control_end_threshold)%, draw $(awk '{printf "%.1f", $1/1e6}' $b/power_now) W"
+    ;;
+  *) echo "usage: power-mode perf|save|auto|user|lab|status"; exit 1 ;;
+esac

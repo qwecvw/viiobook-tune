@@ -1,0 +1,2 @@
+# Let cpu-menu / power-mode change CPU and TLP settings without a password prompt.
+yura ALL=(root) NOPASSWD: /usr/local/bin/cpu-tune, /usr/sbin/tlp

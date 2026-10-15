@@ -1,0 +1,15 @@
+# Firmware images and vendor BIOS: NVIDIA/ASUS licensed, board-specific
+firmware/
+*.rom
+*.zip
+
+# Third-party tools built/downloaded by lab-setup.sh, RyzenAdj built from source
+tools/
+RyzenAdj/
+
+# Runtime output
+*.log
+*.csv
+__pycache__/
+*.pyc
+result.jpg

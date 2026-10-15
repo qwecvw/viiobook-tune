@@ -1,0 +1,130 @@
+#!/bin/sh
+# Fan guard for cpu-menu user mode: when the CPU (k10temp Tctl) reaches the temperature in
+# /etc/cpu-menu/fanmax, switch the ASUS fan to full speed (pwm1_enable=0); hand it back to
+# the firmware curve (pwm1_enable=2) once it cools HYST degrees below. Runs as a service.
+# Fan cap (/etc/cpu-menu/fancap, rpm): the firmware has no rpm limit, so when the fan spins
+# faster than the cap, lower the CPU power limit (ryzenadj) in STEP mW steps down to FLOOR;
+# the CPU cools and the firmware slows the fan. Raise it back while the fan is well below.
+# Never goes above the user Power limit (or the firmware's own when that is off).
+# Also publishes CPU package power (RAPL, root-only) in mW to /run/cpu-menu/pkg-power for cpu-menu,
+# and the fan-cap power limit in mW to /run/cpu-menu/fancap-limit.
+# NVIDIA clock offsets (/etc/cpu-menu/nvoc, user mode) are lost when the GPU sleeps:
+# re-apply them each time it wakes up (never wakes it by itself).
+conf=/etc/cpu-menu
+HYST=5
+STEP=2000
+FLOOR=8000
+
+hwmon() { # name -> dir
+  for h in /sys/class/hwmon/hwmon*; do
+    if [ "$(cat $h/name)" = "$1" ]; then echo $h; return; fi
+  done
+}
+temp=$(hwmon k10temp)/temp1_input
+fan=$(hwmon asus)/pwm1_enable
+rpm=$(hwmon asus)/fan1_input
+profile=/sys/firmware/acpi/platform_profile
+[ -f "$temp" ] && [ -f "$fan" ] || { echo "no k10temp or asus fan control"; exit 1; }
+
+rapl=/sys/class/powercap/intel-rapl:0
+out=/run/cpu-menu/pkg-power
+mkdir -p /run/cpu-menu
+e_prev=$(cat $rapl/energy_uj 2>/dev/null || echo "")
+e_range=$(cat $rapl/max_energy_range_uj 2>/dev/null || echo 0)
+
+nvdev=""
+for d in /sys/bus/pci/devices/*; do
+  if [ "$(cat $d/vendor)" = 0x10de ] && [ "$(cut -c1-4 $d/class)" = 0x03 ]; then nvdev=$d; break; fi
+done
+
+nv_sync() { # put the wanted offsets on a freshly woken GPU
+  want="0 0"
+  if [ $custom = 1 ] && [ -f $pdir/nvoc ]; then want=$(cat $pdir/nvoc); fi
+  if [ "$want" != "0 0" ] || [ -f /run/cpu-menu/nvoc-applied ]; then
+    # shellcheck disable=SC2086
+    if nv-oc set $want; then
+      if [ "$want" = "0 0" ]; then rm -f /run/cpu-menu/nvoc-applied; else echo "$want" > /run/cpu-menu/nvoc-applied; fi
+    fi
+  fi
+}
+
+ceiling() { # mW: profile Power limit, else the remembered firmware limit
+  pw=$(cat $pdir/power 2>/dev/null)
+  case "$pw" in ''|off|*[!0-9]*) ;; *) echo $((pw * 1000)); return ;; esac
+  fast=$(sed -n 's/^FAST=//p' $conf/power-stock 2>/dev/null)
+  echo "${fast:-45000}"
+}
+
+set_limit() { # mW
+  ryzenadj --stapm-limit=$1 --fast-limit=$1 --slow-limit=$1 >/dev/null 2>&1
+  echo $1 > /run/cpu-menu/fancap-limit
+}
+
+restore_limit() { # back to the profile Power limit or the firmware's own
+  pw=$(cat $pdir/power 2>/dev/null)
+  case "$pw" in
+    ''|off|*[!0-9]*) if [ -f $profile ]; then p=$(cat $profile); echo "$p" > $profile; fi ;;
+    *) ryzenadj --stapm-limit=$((pw * 1000)) --fast-limit=$((pw * 1000)) --slow-limit=$((pw * 1000)) >/dev/null 2>&1 ;;
+  esac
+  rm -f /run/cpu-menu/fancap-limit
+}
+
+rm -f /run/cpu-menu/fancap-limit
+nv_prev=""
+forced=0
+cur=""   # current fan-cap power limit, mW; empty = not capping
+tick=0
+while :; do
+  if [ -n "$e_prev" ]; then  # µJ over the 2 s loop -> mW
+    e=$(cat $rapl/energy_uj)
+    d=$((e - e_prev)); [ $d -ge 0 ] || d=$((d + e_range))
+    echo $((d / 2000)) > $out.tmp && mv $out.tmp $out
+    e_prev=$e
+  fi
+
+  # Settings live in the active custom profile: /etc/cpu-menu/user/ or /etc/cpu-menu/lab/
+  mode=$(cat $conf/mode 2>/dev/null)
+  case "$mode" in user|lab) custom=1 ;; *) custom=0 ;; esac
+  pdir=$conf/$mode
+
+  limit=$(cat $pdir/fanmax 2>/dev/null)
+  if [ $custom = 1 ] && [ -n "$limit" ]; then
+    t=$(( $(cat $temp) / 1000 ))
+    if [ $t -ge $limit ] && [ $forced = 0 ]; then
+      echo 0 > $fan; forced=1
+    elif [ $t -le $((limit - HYST)) ] && [ $forced = 1 ]; then
+      echo 2 > $fan; forced=0
+    fi
+  elif [ $forced = 1 ]; then
+    echo 2 > $fan; forced=0
+  fi
+
+  if [ -n "$nvdev" ] && [ -d /sys/module/nvidia ]; then
+    st=$(cat $nvdev/power/runtime_status)
+    if [ "$st" = active ] && [ "$nv_prev" != active ]; then nv_sync; fi
+    nv_prev=$st
+  fi
+
+  cap=$(cat $pdir/fancap 2>/dev/null)
+  # Skipped while "Fan full at" forces full speed: the cap would only throttle the CPU for nothing
+  if [ $custom = 1 ] && [ -n "$cap" ] && [ $forced = 0 ] &&
+     command -v ryzenadj >/dev/null; then
+    tick=$((tick + 1))
+    if [ $((tick % 3)) = 0 ]; then  # every 6 s: the fan reacts to temperature with a lag
+      top=$(ceiling)
+      [ -n "$cur" ] || cur=$top
+      [ $cur -le $top ] || cur=$top
+      r=$(cat $rpm)
+      if [ $r -gt $cap ] && [ $cur -gt $FLOOR ]; then
+        cur=$((cur - STEP)); [ $cur -ge $FLOOR ] || cur=$FLOOR
+        set_limit $cur
+      elif [ $r -lt $((cap - 1000)) ] && [ $cur -lt $top ]; then
+        cur=$((cur + STEP)); [ $cur -le $top ] || cur=$top
+        if [ $cur = $top ]; then restore_limit; else set_limit $cur; fi
+      fi
+    fi
+  elif [ -n "$cur" ]; then
+    restore_limit; cur=""
+  fi
+  sleep 2
+done

@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""GTK version of cpu-menu (backup): power profile + frequency limits + live per-core MHz.
+
+Privileged writes go through `sudo -n cpu-tune` and `power-mode` (NOPASSWD rules in
+/etc/sudoers.d/cpu-tune). Running it again while open closes the window (toggle).
+"""
+import os
+import signal
+import subprocess
+import threading
+
+import gi
+
+gi.require_version("Gdk", "3.0")
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+
+CPU = "/sys/devices/system/cpu"
+FREQ = f"{CPU}/cpu0/cpufreq"
+PIDFILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "cpu-menu-gtk.pid")
+MODES = [("perf", "Производительность"), ("save", "Эко")]
+
+
+def read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def mhz(khz):
+    return f"{int(khz) // 1000} MHz"
+
+
+def toggle_existing():
+    """Close an already open menu and return True, so the hotkey acts as a toggle."""
+    try:
+        pid = int(read(PIDFILE, "0"))
+        if pid and read(f"/proc/{pid}/cmdline").find("cpu-menu-gtk") >= 0:
+            os.kill(pid, signal.SIGTERM)
+            return True
+    except (ValueError, ProcessLookupError, PermissionError):
+        pass
+    return False
+
+
+class Menu(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="CPU")
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_keep_above(True)
+        self.set_resizable(False)
+        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        self.set_border_width(14)
+        self.connect("key-press-event", lambda w, e: e.keyval == 0xFF1B and self.close())
+        self.connect("destroy", Gtk.main_quit)
+
+        self.updating = False
+        self.cpus = sorted(
+            (d for d in os.listdir(CPU) if d[3:].isdigit() and d.startswith("cpu")),
+            key=lambda d: int(d[3:]),
+        )
+        self.freqs = sorted(map(int, read(f"{FREQ}/scaling_available_frequencies").split()))
+        self.hw_max = int(read(f"{FREQ}/cpuinfo_max_freq"))
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.add(box)
+
+        # Power profile (TLP via power-mode)
+        box.pack_start(self.heading("Режим питания"), False, False, 0)
+        row = Gtk.Box(spacing=6)
+        self.mode_btns = {}
+        for key, label in MODES:
+            b = Gtk.ToggleButton(label=label)
+            b.connect("toggled", self.on_mode, key)
+            row.pack_start(b, True, True, 0)
+            self.mode_btns[key] = b
+        box.pack_start(row, False, False, 0)
+
+        # Frequency limits
+        box.pack_start(self.heading("Частота ядер"), False, False, 0)
+        grid = Gtk.Grid(column_spacing=10, row_spacing=6)
+        box.pack_start(grid, False, False, 0)
+
+        self.max_combo = self.freq_combo(lambda c: self.on_freq(c, "max"))
+        self.min_combo = self.freq_combo(lambda c: self.on_freq(c, "min"))
+        self.gov_combo = Gtk.ComboBoxText()
+        for g in read(f"{FREQ}/scaling_available_governors").split():
+            self.gov_combo.append(g, g)
+        self.gov_combo.connect("changed", self.on_governor)
+        self.boost = Gtk.Switch(halign=Gtk.Align.START)
+        self.boost.connect("notify::active", self.on_boost)
+
+        for i, (text, widget) in enumerate([
+            ("Максимум", self.max_combo),
+            ("Минимум", self.min_combo),
+            ("Буст (выше базовой)", self.boost),
+            ("Governor", self.gov_combo),
+        ]):
+            grid.attach(Gtk.Label(label=text, xalign=0), 0, i, 1, 1)
+            grid.attach(widget, 1, i, 1, 1)
+
+        reset = Gtk.Button(label="Сбросить к режиму питания")
+        reset.connect("clicked", self.on_reset)
+        box.pack_start(reset, False, False, 0)
+
+        # Live per-core frequencies
+        box.pack_start(self.heading("Сейчас"), False, False, 0)
+        cores = Gtk.Grid(column_spacing=8, row_spacing=3)
+        box.pack_start(cores, False, False, 0)
+        self.bars = []
+        half = (len(self.cpus) + 1) // 2
+        for i, c in enumerate(self.cpus):
+            col, r = (i // half) * 3, i % half
+            bar = Gtk.LevelBar(min_value=0, max_value=self.hw_max * 1.35, hexpand=True)
+            bar.set_size_request(110, -1)
+            val = Gtk.Label(xalign=1, width_chars=9)
+            cores.attach(Gtk.Label(label=c, xalign=0), col, r, 1, 1)
+            cores.attach(bar, col + 1, r, 1, 1)
+            cores.attach(val, col + 2, r, 1, 1)
+            self.bars.append((c, bar, val))
+
+        self.status = Gtk.Label(xalign=0, wrap=True, max_width_chars=50)
+        self.status.get_style_context().add_class("dim-label")
+        box.pack_start(self.status, False, False, 0)
+
+        self.refresh()
+        self.tick()
+        GLib.timeout_add(1000, self.tick)
+
+    @staticmethod
+    def heading(text):
+        lbl = Gtk.Label(xalign=0)
+        lbl.set_markup(f"<b>{text}</b>")
+        return lbl
+
+    def freq_combo(self, handler):
+        combo = Gtk.ComboBoxText()
+        for f in self.freqs:
+            combo.append(str(f), mhz(f))
+        combo.connect("changed", handler)
+        return combo
+
+    # --- state ---------------------------------------------------------------
+    def refresh(self):
+        """Sync controls with sysfs without firing handlers."""
+        self.updating = True
+        pwr = read("/run/tlp/last_pwr")
+        mode = {"0": "perf", "1": "save"}.get(pwr)
+        for key, b in self.mode_btns.items():
+            b.set_active(key == mode)
+        self.max_combo.set_active_id(read(f"{FREQ}/scaling_max_freq"))
+        self.min_combo.set_active_id(read(f"{FREQ}/scaling_min_freq"))
+        self.gov_combo.set_active_id(read(f"{FREQ}/scaling_governor"))
+        self.boost.set_active(read(f"{CPU}/cpufreq/boost") == "1")
+        self.updating = False
+
+    def tick(self):
+        for c, bar, val in self.bars:
+            f = int(read(f"{CPU}/{c}/cpufreq/scaling_cur_freq", "0"))
+            bar.set_value(min(f, bar.get_max_value()))
+            val.set_text(mhz(f))
+        return True
+
+    # --- actions -------------------------------------------------------------
+    def run(self, *cmd):
+        """Run a privileged command off the UI thread, then resync controls."""
+        self.status.set_text("…")
+
+        def work():
+            try:
+                p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                out = (p.stderr or p.stdout).strip().splitlines()
+                msg = "" if p.returncode == 0 else f"Ошибка: {out[-1] if out else p.returncode}"
+            except Exception as e:  # noqa: BLE001
+                msg = f"Ошибка: {e}"
+            GLib.idle_add(self.done, msg)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def done(self, msg):
+        self.status.set_text(msg or "")
+        self.refresh()
+        return False
+
+    def tune(self, *args):
+        self.run("sudo", "-n", "/usr/local/bin/cpu-tune", *args)
+
+    def on_mode(self, btn, key):
+        if self.updating:
+            return
+        if not btn.get_active():  # keep current mode pressed
+            self.refresh()
+            return
+        self.run("power-mode", key)
+
+    def on_freq(self, combo, which):
+        if not self.updating and combo.get_active_id():
+            self.tune(which, combo.get_active_id())
+
+    def on_governor(self, combo):
+        if not self.updating and combo.get_active_id():
+            self.tune("governor", combo.get_active_id())
+
+    def on_boost(self, sw, _):
+        if not self.updating:
+            self.tune("boost", "1" if sw.get_active() else "0")
+
+    def on_reset(self, _):
+        mode = {"0": "perf", "1": "save"}.get(read("/run/tlp/last_pwr"), "auto")
+        self.run("power-mode", mode)
+
+
+def main():
+    if toggle_existing():
+        return
+    with open(PIDFILE, "w") as f:
+        f.write(str(os.getpid()))
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, Gtk.main_quit)
+    win = Menu()
+    win.show_all()
+    win.present()
+    try:
+        Gtk.main()
+    finally:
+        if read(PIDFILE) == str(os.getpid()):
+            os.remove(PIDFILE)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,3 @@
+#!/bin/sh
+# systemd-sleep hook: the SMU resets power limits on suspend; re-apply the user profile on resume.
+case "$1" in post) /usr/local/bin/cpu-tune apply ;; esac

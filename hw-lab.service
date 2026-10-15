@@ -1,0 +1,9 @@
+[Unit]
+Description=Hardware Lab watchdog and telemetry for cpu-menu
+After=cpu-fan-guard.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hw-lab
+Restart=on-failure
+RestartSec=3

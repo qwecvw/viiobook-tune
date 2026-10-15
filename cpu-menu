@@ -1,0 +1,542 @@
+#!/usr/bin/env python3
+"""CPU/GPU menu in CLI style (Super+Insert): power profile, CPU frequency limits,
+live per-core MHz, NVIDIA sleep status and clock cap, AMD iGPU performance level.
+
+From a hotkey (no tty) it opens itself in a small xfce4-terminal; in a terminal it runs
+inline. Running it again while open closes it (toggle). Privileged writes go through
+`sudo -n cpu-tune` and `power-mode` (NOPASSWD rules in /etc/sudoers.d/cpu-tune).
+GUI version: cpu-menu-gtk.
+"""
+import curses
+import locale
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+CPU = "/sys/devices/system/cpu"
+FREQ = f"{CPU}/cpu0/cpufreq"
+PIDFILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "cpu-menu.pid")
+TERMINAL = ["xfce4-terminal", "--disable-server", "--title=CPU", "--geometry=66x36",
+            "--hide-menubar", "--hide-toolbar", "--hide-scrollbar", "-x"]
+WIDTH = 64
+PROFILE = "/sys/firmware/acpi/platform_profile"  # ASUS quiet/balanced/performance (fan + power)
+NVCLOCK_FILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "cpu-menu-nvclock")
+NV_STATS_EVERY = 3  # seconds; nvidia-smi only runs while an app already uses the GPU
+
+
+def read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def mhz(khz):
+    return f"{int(khz) // 1000} MHz"
+
+
+def current_mode():
+    m = read("/etc/cpu-menu/mode")
+    if m in ("user", "lab"):
+        return m
+    return {"0": "perf", "1": "save"}.get(read("/run/tlp/last_pwr"), "auto")
+
+
+def custom():
+    """user or lab: the modes with their own profile (/etc/cpu-menu/<mode>/)."""
+    return current_mode() in ("user", "lab")
+
+
+def pfile(name, default=""):
+    """Setting stored in the active custom profile."""
+    return read(f"/etc/cpu-menu/{current_mode()}/{name}", default)
+
+
+def is_online(c):
+    return read(f"{CPU}/{c}/online", "1") == "1"  # cpu0 has no online file: always on
+
+
+def find_nvidia():
+    """PCI sysfs dir of the NVIDIA GPU, or None."""
+    base = "/sys/bus/pci/devices"
+    for d in sorted(os.listdir(base)):
+        if read(f"{base}/{d}/vendor") == "0x10de" and read(f"{base}/{d}/class").startswith("0x03"):
+            return f"{base}/{d}"
+    return None
+
+
+def find_amdgpu():
+    """sysfs device dir of the AMD iGPU, or None."""
+    for c in sorted(os.listdir("/sys/class/drm")):
+        dev = f"/sys/class/drm/{c}/device"
+        if c[4:].isdigit() and os.path.basename(os.path.realpath(f"{dev}/driver")) == "amdgpu":
+            return dev
+    return None
+
+
+def prime_mode():
+    """prime-select profile from its config file (no subprocess): on-demand / intel / nvidia."""
+    return {"on": "nvidia", "off": "intel"}.get(read("/etc/prime-discrete"), read("/etc/prime-discrete"))
+
+
+def toggle_existing():
+    """Close an already open menu and return True, so the hotkey acts as a toggle."""
+    try:
+        pid = int(read(PIDFILE, "0"))
+        if pid and "cpu-menu" in read(f"/proc/{pid}/cmdline"):
+            os.kill(pid, signal.SIGTERM)
+            return True
+    except (ValueError, ProcessLookupError, PermissionError):
+        pass
+    return False
+
+
+class Setting:
+    """One menu row: a list of values cycled with ←/→, or an action run with Enter."""
+
+    def __init__(self, label, values=None, show=str, get=None, apply=None, action=None, header=None,
+                 visible=None, kind=None):
+        self.label, self._values, self.show = label, values or [], show
+        self.get, self.apply, self.action = get, apply, action
+        self.header = header  # section title drawn above this row
+        self.visible = visible or (lambda: True)
+        self.kind = kind  # "cores": per-CPU on/off cells instead of a value list
+
+    @property
+    def values(self):
+        """A list, or a function returning one (ranges that depend on the mode)."""
+        return self._values() if callable(self._values) else self._values
+
+
+class Menu:
+    def __init__(self, scr):
+        self.scr = scr
+        self.sel = 0
+        self.core_cur = 1  # cursor in the Cores row (cpu0 can't sleep)
+        self.status = ""
+        self.busy = False
+        self.cpus = sorted((d for d in os.listdir(CPU) if d.startswith("cpu") and d[3:].isdigit()),
+                           key=lambda d: int(d[3:]))
+        self.hw_max = int(read(f"{FREQ}/cpuinfo_max_freq"))
+        hw_min = int(read(f"{FREQ}/cpuinfo_min_freq"))
+        # Base (non-boost) clock: CPPC nominal with amd_pstate, else the top P-state
+        self.base = int(read(f"{CPU}/cpu0/acpi_cppc/nominal_freq", "0")) * 1000 or self.hw_max
+        self.bar_max = max(self.hw_max, self.base * 1.3)
+        # acpi-cpufreq lists its few P-states; amd_pstate takes any value: 100 MHz steps
+        freqs = sorted(read(f"{FREQ}/scaling_available_frequencies").split(), key=int) or \
+            [str(f) for f in range(hw_min, self.hw_max, 100000)] + [str(self.hw_max)]
+        epp_file = f"{FREQ}/energy_performance_preference"
+        # Full list: with governor performance the driver reports only "performance"
+        epps = ["performance", "balance_performance", "balance_power", "power"]
+        tune = lambda *a: self.run("sudo", "-n", "/usr/local/bin/cpu-tune", *a)  # noqa: E731
+        self.rows = [
+            Setting("Power mode", ["perf", "save", "user", "lab"],
+                    show={"perf": "performance", "save": "eco", "user": "user", "lab": "lab"}.get,
+                    get=current_mode, apply=lambda v: self.run("power-mode", v)),
+            Setting("Cores", kind="cores", visible=lambda: custom()),
+            Setting("Max freq", freqs, show=mhz,
+                    get=lambda: read(f"{FREQ}/scaling_max_freq"), apply=lambda v: tune("max", v)),
+            Setting("Min freq", freqs, show=mhz,
+                    get=lambda: read(f"{FREQ}/scaling_min_freq"), apply=lambda v: tune("min", v)),
+            Setting("Boost", ["0", "1"], show={"0": "off", "1": "on"}.get,
+                    get=lambda: read(f"{CPU}/cpufreq/boost"), apply=lambda v: tune("boost", v),
+                    visible=lambda: os.path.exists(f"{CPU}/cpufreq/boost")),
+            # amd_pstate has no boost switch: boost = max freq above the base clock
+            Setting("Boost", ["0", "1"], show={"0": "off", "1": "on"}.get,
+                    get=lambda: "1" if int(read(f"{FREQ}/scaling_max_freq", "0")) > self.base else "0",
+                    apply=lambda v: tune("max", str(self.hw_max if v == "1" else self.base)),
+                    visible=lambda: not os.path.exists(f"{CPU}/cpufreq/boost") and self.base < self.hw_max),
+            Setting("Governor", read(f"{FREQ}/scaling_available_governors").split(),
+                    get=lambda: read(f"{FREQ}/scaling_governor"), apply=lambda v: tune("governor", v)),
+            Setting("EPP", epps, show={"performance": "perf", "balance_performance": "bal-perf",
+                                       "balance_power": "bal-power", "power": "power"}.get,
+                    get=lambda: read(epp_file), apply=lambda v: tune("epp", v),
+                    visible=lambda: os.path.exists(epp_file)),
+            # lab may go past the firmware's 45-46 W (cpu-tune caps it at 60 W)
+            Setting("Power limit", lambda: [str(w) for w in range(10, 65 if current_mode() == "lab" else 45, 5)]
+                    + ["off"],
+                    show=lambda v: "stock" if v == "off" else f"{v} W",
+                    get=lambda: pfile("power", "off"), apply=lambda v: tune("power", v),
+                    visible=lambda: custom()),
+            Setting("Fan profile", read(f"{PROFILE}_choices").split(),
+                    get=lambda: read(PROFILE), apply=lambda v: tune("profile", v),
+                    visible=lambda: custom() and os.path.exists(PROFILE)),
+            Setting("Fan max rpm", ["2000", "2500", "3000", "3500", "4000", "5000", "off"],
+                    get=lambda: pfile("fancap", "off"), apply=lambda v: tune("fancap", v),
+                    visible=lambda: custom()),
+            Setting("Fan full at", ["off"] + [str(t) for t in range(35, 100, 5)],
+                    show=lambda v: v if v == "off" else f"{v}°C",
+                    get=lambda: pfile("fanmax", "off"), apply=lambda v: tune("fanmax", v),
+                    visible=lambda: custom()),
+            Setting("Reset to power mode",
+                    action=lambda: self.run("power-mode", current_mode())),
+        ]
+
+        self.nv = find_nvidia()
+        self.amd = find_amdgpu()
+        self.nv_stats = ""
+        self.nv_polled = 0.0
+        self.k10temp = next((f"/sys/class/hwmon/{h}/temp1_input" for h in os.listdir("/sys/class/hwmon")
+                             if read(f"/sys/class/hwmon/{h}/name") == "k10temp"), None)
+        self.fan = next((f"/sys/class/hwmon/{h}/fan1_input" for h in os.listdir("/sys/class/hwmon")
+                         if os.path.exists(f"/sys/class/hwmon/{h}/fan1_input")), None)
+        self.stat_prev = self.cpu_times()
+        self.load = 0
+        # NVIDIA: the status row is always shown, its settings fold out with Enter / →
+        self.nv_open = False
+        nv_section = os.path.exists("/etc/prime-discrete") or self.nv
+        opened = lambda: self.nv_open  # noqa: E731
+        if nv_section:
+            self.rows.append(Setting("NVIDIA", kind="nvsection", header="gpu"))
+        if os.path.exists("/etc/prime-discrete"):
+            self.rows.append(
+                Setting("Use NVIDIA", ["on-demand", "intel"],
+                        show={"on-demand": "on demand", "intel": "never"}.get,
+                        get=prime_mode, apply=lambda v: self.run(
+                            "sudo", "-n", "/usr/local/bin/cpu-tune", "prime", v, timeout=300),
+                        visible=opened))
+        if self.nv:
+            nvoc = lambda i: (pfile("nvoc", "0 0").split() + ["0", "0"])[i]  # noqa: E731
+            self.rows += [
+                Setting("NVIDIA core +",
+                        lambda: [str(v) for v in range(0, 1001 if current_mode() == "lab" else 301, 50)],
+                        show=lambda v: "stock" if v == "0" else f"+{v} MHz",
+                        get=lambda: nvoc(0), apply=lambda v: tune("nvoc", v, nvoc(1)),
+                        visible=lambda: self.nv_open and custom()),
+                Setting("NVIDIA mem +",
+                        lambda: [str(v) for v in range(0, 6001 if current_mode() == "lab" else 2001, 250)],
+                        show=lambda v: "stock" if v == "0" else f"+{v} MHz",
+                        get=lambda: nvoc(1), apply=lambda v: tune("nvoc", nvoc(0), v),
+                        visible=lambda: self.nv_open and custom()),
+                Setting("NVIDIA max clk", ["full", "1800", "1500", "1200", "900"],
+                        show=lambda v: v if v == "full" else f"{v} MHz",
+                        get=lambda: read(NVCLOCK_FILE, "full"), apply=self.set_nvclock,
+                        visible=opened),
+            ]
+        if self.amd:
+            self.rows.append(
+                Setting("AMD iGPU", ["auto", "low", "high"],
+                        get=lambda: read(f"{self.amd}/power_dpm_force_performance_level"),
+                        apply=lambda v: tune("amdgpu", v),
+                        header=None if nv_section else "gpu"))
+
+        curses.curs_set(0)
+        curses.use_default_colors()
+        blue = 25 if curses.COLORS >= 256 else curses.COLOR_BLUE  # 25 = #005faf dark blue
+        for i, c in enumerate([blue, curses.COLOR_GREEN, curses.COLOR_YELLOW,
+                               curses.COLOR_RED], start=1):
+            curses.init_pair(i, c, -1)
+        self.BLUE, self.GREEN, self.YELLOW, self.RED = (curses.color_pair(i) for i in range(1, 5))
+        scr.timeout(700)  # live refresh interval
+
+    # --- actions -------------------------------------------------------------
+    def run(self, *cmd, then=None, timeout=30):
+        """Run a privileged command off the UI thread; the next redraw shows the result."""
+        if self.busy:
+            return
+        self.busy, self.status = True, f"$ {' '.join(c for c in cmd if c != '-n')}"
+
+        def work():
+            try:
+                p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                out = (p.stderr or p.stdout).strip().splitlines()
+                self.status = "ok" if p.returncode == 0 else f"error: {out[-1] if out else p.returncode}"
+                if p.returncode == 0 and then:
+                    then()
+            except Exception as e:  # noqa: BLE001
+                self.status = f"error: {e}"
+            self.busy = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def set_nvclock(self, v):
+        def remember():
+            with open(NVCLOCK_FILE, "w") as f:
+                f.write(v)
+        self.run("sudo", "-n", "/usr/local/bin/cpu-tune", "nvclock", "reset" if v == "full" else v,
+                 then=remember)
+
+    def nv_state(self):
+        """'sleeping' / 'active' from sysfs: reading it never wakes the GPU."""
+        if not self.nv or not os.path.exists("/sys/module/nvidia"):
+            return "off"
+        st = read(f"{self.nv}/power/runtime_status")
+        return {"suspended": "sleeping", "active": "active"}.get(st, st or "?")
+
+    def prime_pending(self):
+        """True when the chosen prime profile differs from what this boot is running."""
+        loaded = os.path.exists("/sys/module/nvidia")
+        return (prime_mode() == "intel") == loaded
+
+    @staticmethod
+    def nv_users():
+        """Count our processes holding /dev/nvidia* open (apps on the GPU); /proc scan never wakes it."""
+        n, me = 0, str(os.getpid())
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit() or pid == me:
+                continue
+            try:
+                fds = os.listdir(f"/proc/{pid}/fd")
+            except OSError:
+                continue
+            for fd in fds:
+                try:
+                    if os.readlink(f"/proc/{pid}/fd/{fd}").startswith("/dev/nvidia"):
+                        n += 1
+                        break
+                except OSError:
+                    pass
+        return n
+
+    def poll_nv_stats(self):
+        """nvidia-smi in background, only while some app keeps the GPU awake anyway:
+        polling an idle GPU would stop it from going back to sleep."""
+        now = time.monotonic()
+        if now - self.nv_polled < NV_STATS_EVERY:
+            return
+        self.nv_polled = now
+        if self.nv_state() != "active" or not self.nv_users():
+            self.nv_stats = ""
+            return
+
+        def work():
+            try:
+                out = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=pstate,temperature.gpu,power.draw,clocks.gr,utilization.gpu",
+                     "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5).stdout
+                ps, temp, watt, clk, util = (x.strip() for x in out.split(","))
+                self.nv_stats = f"{ps}  {temp}°C  {float(watt):.1f} W  {clk} MHz  {util}%"
+            except Exception:  # noqa: BLE001
+                self.nv_stats = ""
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @staticmethod
+    def cpu_times():
+        """(busy, total) jiffies summed over all CPUs from /proc/stat."""
+        f = list(map(int, read("/proc/stat").split("\n", 1)[0].split()[1:]))
+        idle = f[3] + f[4]  # idle + iowait
+        return sum(f) - idle, sum(f)
+
+    def cpu_status(self):
+        now = self.cpu_times()
+        db, dt = now[0] - self.stat_prev[0], now[1] - self.stat_prev[1]
+        if dt > 0:
+            self.load = round(100 * db / dt)
+        self.stat_prev = now
+        freqs = [int(read(f"{CPU}/{c}/cpufreq/scaling_cur_freq", "0")) for c in self.cpus if is_online(c)]
+        parts = []
+        if self.k10temp:
+            parts.append(f"{int(read(self.k10temp, '0')) // 1000}°C")
+        parts.append(f"load {self.load}%")
+        parts.append(f"avg {sum(freqs) // len(freqs) // 1000} MHz")
+        if len(freqs) < len(self.cpus):
+            parts.append(f"on {len(freqs)}/{len(self.cpus)}")
+        if self.fan:
+            full = read(os.path.join(os.path.dirname(self.fan), "pwm1_enable")) == "0"
+            parts.append(f"fan {read(self.fan, '0')} rpm{' MAX' if full else ''}")
+        return "  ".join(parts)
+
+    @staticmethod
+    def power_status():
+        parts = []
+        pkg = read("/run/cpu-menu/pkg-power")  # mW, from the cpu-fan-guard service (RAPL is root-only)
+        if pkg.isdigit():
+            parts.append(f"cpu {int(pkg) / 1000:.1f} W")
+        limit = pfile("power", "off")
+        capped = read("/run/cpu-menu/fancap-limit")  # set while the fan cap is throttling
+        if custom() and capped.isdigit():
+            parts.append(f"(fan cap: limit {int(capped) // 1000} W)")
+        elif custom() and limit != "off":
+            parts.append(f"(limit {limit} W)")
+        bat = "/sys/class/power_supply/BAT0"
+        if read(f"{bat}/status") == "Discharging":
+            parts.append(f"whole laptop {int(read(f'{bat}/power_now', '0')) / 1e6:.1f} W")
+        return "  ".join(parts)
+
+    def shown(self):
+        return [r for r in self.rows if r.visible()]
+
+    def toggle_core(self):
+        c = self.cpus[self.core_cur]
+        if c != "cpu0" and not self.busy:
+            self.run("sudo", "-n", "/usr/local/bin/cpu-tune", "online", c[3:], "0" if is_online(c) else "1")
+
+    def step(self, delta, wrap=False):
+        row = self.shown()[self.sel]
+        if not row.values or self.busy:
+            return
+        cur = row.get()
+        n = len(row.values)
+        if cur in row.values:
+            i = row.values.index(cur) + delta
+        elif cur.isdigit():  # value between list steps (e.g. 1108 MHz): move to the neighbour
+            below = sum(int(v) < int(cur) for v in row.values)
+            i = below if delta > 0 else below - 1
+        else:
+            i = 0
+        new = row.values[i % n if wrap else max(0, min(n - 1, i))]
+        if new != cur:
+            row.apply(new)
+
+    # --- drawing -------------------------------------------------------------
+    def put(self, y, x, text, attr=0):
+        try:
+            self.scr.addstr(y, x, text, attr)
+        except curses.error:  # window too small: clip silently
+            pass
+
+    def rule(self, y):
+        self.put(y, 0, "─" * WIDTH, curses.A_DIM)
+
+    def draw(self):
+        s = self.scr
+        s.erase()
+        model = next((l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo")
+                      if l.startswith("model name")), "CPU")
+        self.put(0, 0, "cpu-menu", self.BLUE | curses.A_BOLD)
+        self.put(0, WIDTH - len(model), model, curses.A_DIM)
+        self.rule(1)
+
+        y = 2
+        rows = self.shown()
+        self.sel = min(self.sel, len(rows) - 1)
+        for i, row in enumerate(rows):
+            if row.header:
+                self.rule(y)
+                y += 1
+            active = i == self.sel
+            self.put(y, 0, ">" if active else " ", self.BLUE | curses.A_BOLD)
+            label = f"{'▾' if self.nv_open else '▸'} {row.label}" if row.kind == "nvsection" else row.label
+            self.put(y, 2, label, self.BLUE | curses.A_BOLD if active else 0)
+            if row.kind == "nvsection":  # state + live stats stay visible when folded
+                state = self.nv_state()
+                self.put(y, 22, state, (self.YELLOW if state == "active" else self.GREEN) | curses.A_BOLD)
+                if self.prime_pending():
+                    self.put(y, 22 + len(state) + 2, "reboot to apply", self.RED | curses.A_BOLD)
+                elif state == "active":
+                    self.put(y, 22 + len(state) + 2, self.nv_stats or "no apps, falling asleep", curses.A_DIM)
+            elif row.kind == "cores":
+                x = 22
+                for j, c in enumerate(self.cpus):  # green = working, dim = sleeping
+                    attr = self.GREEN | curses.A_BOLD | curses.A_REVERSE if is_online(c) else curses.A_DIM
+                    if active and j == self.core_cur:
+                        attr |= curses.A_UNDERLINE
+                        self.put(y + 1, x, "^^", self.BLUE | curses.A_BOLD)
+                    self.put(y, x, f"{c[3:]:>2}", attr)
+                    x += 3
+                if active:
+                    y += 1
+                    self.put(y, 2, "Enter: sleep/wake", curses.A_DIM)
+            elif row.values:
+                cur = row.get()
+                texts = [row.show(v) or v for v in row.values]
+                on = self.GREEN | curses.A_BOLD | curses.A_REVERSE
+                x = 22
+                if sum(len(t) + 3 for t in texts) <= WIDTH - x:
+                    for v, text in zip(row.values, texts):  # all options inline, current highlighted
+                        self.put(y, x, f" {text} ", on if v == cur else curses.A_DIM)
+                        x += len(text) + 3
+                else:  # too many options: show only the current one as a spinner
+                    i = row.values.index(cur) if cur in row.values else -1
+                    self.put(y, x, "◂", curses.A_DIM)
+                    self.put(y, x + 2, f" {row.show(cur) or cur} ", on)
+                    self.put(y, x + len(row.show(cur) or cur) + 5, f"▸  {i + 1}/{len(texts)}", curses.A_DIM)
+            y += 1
+        self.rule(y)
+        y += 1
+
+        half = (len(self.cpus) + 1) // 2
+        bar_w = 14
+        for i, c in enumerate(self.cpus):
+            x, r = (i // half) * 33, y + i % half
+            if not is_online(c):
+                self.put(r, x, f"{c:<5}", curses.A_DIM)
+                self.put(r, x + 6, "·" * bar_w, curses.A_DIM)
+                self.put(r, x + 7 + bar_w, "  sleep", curses.A_DIM)
+                continue
+            f = int(read(f"{CPU}/{c}/cpufreq/scaling_cur_freq", "0"))
+            fill = min(bar_w, round(f / self.bar_max * bar_w))
+            color = self.RED if f > self.base else self.YELLOW if f > self.base * 0.6 else self.GREEN
+            self.put(r, x, f"{c:<5}", curses.A_DIM)
+            self.put(r, x + 6, "━" * fill, color | curses.A_BOLD)
+            self.put(r, x + 6 + fill, "─" * (bar_w - fill), curses.A_DIM)
+            self.put(r, x + 7 + bar_w, f"{f // 1000:>5} MHz")
+        y += half
+        self.put(y, 0, "CPU", curses.A_BOLD)
+        self.put(y, 6, self.cpu_status(), curses.A_DIM)
+        y += 1
+        self.put(y, 0, "Power", curses.A_BOLD)
+        self.put(y, 6, self.power_status(), curses.A_DIM)
+        y += 1
+        self.rule(y)
+
+        self.put(y + 1, 0, "↑↓ select  ←→ change  Enter apply  q/Esc quit", curses.A_DIM)
+        if self.status:
+            color = self.RED if self.status.startswith("error") else self.YELLOW if self.busy else self.GREEN
+            self.put(y + 2, 0, self.status[:WIDTH], color)
+        s.refresh()
+
+    def loop(self):
+        while True:
+            if self.nv:
+                self.poll_nv_stats()
+            self.draw()
+            k = self.scr.getch()
+            if k in (ord("q"), 27):
+                return
+            rows = self.shown()
+            row = rows[min(self.sel, len(rows) - 1)]
+            cores = row.kind == "cores"
+            if row.kind == "nvsection" and k in (curses.KEY_LEFT, ord("h"), curses.KEY_RIGHT, ord("l"),
+                                                 10, 13, curses.KEY_ENTER, ord(" ")):
+                self.nv_open = k in (curses.KEY_RIGHT, ord("l")) or \
+                    (k not in (curses.KEY_LEFT, ord("h")) and not self.nv_open)
+                continue
+            if k in (curses.KEY_UP, ord("k")):
+                self.sel = (self.sel - 1) % len(rows)
+            elif k in (curses.KEY_DOWN, ord("j")):
+                self.sel = (self.sel + 1) % len(rows)
+            elif k in (curses.KEY_LEFT, ord("h")):
+                if cores:
+                    self.core_cur = max(1, self.core_cur - 1)
+                else:
+                    self.step(-1)
+            elif k in (curses.KEY_RIGHT, ord("l")):
+                if cores:
+                    self.core_cur = min(len(self.cpus) - 1, self.core_cur + 1)
+                else:
+                    self.step(1)
+            elif k in (10, 13, curses.KEY_ENTER, ord(" ")):
+                if cores:
+                    self.toggle_core()
+                elif row.action and not self.busy:
+                    row.action()
+                else:
+                    self.step(1, wrap=True)
+
+
+def main():
+    if toggle_existing():
+        return
+    if not sys.stdin.isatty():  # launched by hotkey: open in its own terminal window
+        os.execvp(TERMINAL[0], TERMINAL + [os.path.abspath(sys.argv[0])])
+
+    with open(PIDFILE, "w") as f:
+        f.write(str(os.getpid()))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # curses.wrapper restores the tty
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    try:
+        curses.wrapper(lambda scr: Menu(scr).loop())
+    finally:
+        if read(PIDFILE) == str(os.getpid()):
+            os.remove(PIDFILE)
+
+
+if __name__ == "__main__":
+    main()

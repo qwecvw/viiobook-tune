@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""hw-lab: watchdog + telemetry for cpu-menu lab mode (runs as root, hw-lab.service).
+
+Logs CPU/GPU sensors to /var/log/hw-lab/<timestamp>.csv every second.
+Writes latest sample to /run/cpu-menu/lab-status (JSON) for cpu-menu.
+
+Watchdog limits (configurable in /etc/cpu-menu/lab/limits, KEY=value):
+  GPU_MAX=92   GPU temp, 2 consecutive samples -> reset NVIDIA offsets to 0
+  CPU_MAX=98   CPU Tctl, 2 consecutive samples -> reset CPU power limit to stock
+  NVRM Xid in kernel log -> reset NVIDIA offsets to 0
+
+A trip resets the lab profile setting too (so it won't re-apply) and logs to events.log.
+Exits when lab mode ends (mode file no longer says 'lab').
+"""
+import csv
+import json
+import os
+import subprocess
+import sys
+import time
+
+CONF = "/etc/cpu-menu"
+LAB = f"{CONF}/lab"
+LOGDIR = "/var/log/hw-lab"
+STATUS = "/run/cpu-menu/lab-status"
+
+REASONS = {0x1: "idle", 0x2: "app", 0x4: "sw_power", 0x8: "hw_slow", 0x10: "sync",
+           0x20: "sw_thermal", 0x40: "hw_thermal", 0x80: "power_brake", 0x100: "display"}
+
+
+def read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def hwmon_file(name, file):
+    for h in os.listdir("/sys/class/hwmon"):
+        if read(f"/sys/class/hwmon/{h}/name") == name:
+            p = f"/sys/class/hwmon/{h}/{file}"
+            if os.path.exists(p):
+                return p
+    return None
+
+
+def load_limits():
+    lim = {"GPU_MAX": 92, "CPU_MAX": 98}
+    for line in read(f"{LAB}/limits").splitlines():
+        k, _, v = line.partition("=")
+        if k.strip() in lim and v.strip().isdigit():
+            lim[k.strip()] = int(v.strip())
+    return lim
+
+
+def event(msg):
+    line = f"{time.strftime('%F %T')}  {msg}"
+    print(line, flush=True)
+    os.makedirs(LOGDIR, exist_ok=True)
+    with open(f"{LOGDIR}/events.log", "a") as f:
+        f.write(line + "\n")
+
+
+def find_nv_pci():
+    base = "/sys/bus/pci/devices"
+    for d in sorted(os.listdir(base)):
+        if read(f"{base}/{d}/vendor") == "0x10de" and read(f"{base}/{d}/class").startswith("0x03"):
+            return f"{base}/{d}"
+    return None
+
+
+def nv_awake(pci):
+    if not pci or not os.path.exists("/sys/module/nvidia"):
+        return False
+    return read(f"{pci}/power/runtime_status") == "active"
+
+
+def nv_temp(pci):
+    if not nv_awake(pci):
+        return None
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=temperature.gpu,power.draw,clocks.gr,clocks.mem",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5).stdout.strip()
+        parts = [x.strip() for x in out.split(",")]
+        if len(parts) == 4:
+            return {"temp": int(parts[0]), "power": float(parts[1]),
+                    "core_clk": int(parts[2]), "mem_clk": int(parts[3])}
+    except Exception:
+        pass
+    return None
+
+
+def cpu_temp():
+    path = hwmon_file("k10temp", "temp1_input")
+    if path:
+        v = read(path)
+        if v.isdigit():
+            return int(v) // 1000
+    return None
+
+
+def cpu_power_mw():
+    pkg = read("/run/cpu-menu/pkg-power")
+    if pkg.isdigit():
+        return int(pkg)
+    return None
+
+
+def fan_rpm():
+    path = hwmon_file("asus", "fan1_input")
+    if path:
+        v = read(path)
+        if v.isdigit():
+            return int(v)
+    return None
+
+
+def cpu_avg_freq():
+    total, count = 0, 0
+    base = "/sys/devices/system/cpu"
+    for d in os.listdir(base):
+        if d.startswith("cpu") and d[3:].isdigit():
+            f = read(f"{base}/{d}/cpufreq/scaling_cur_freq")
+            if f.isdigit():
+                total += int(f)
+                count += 1
+    return total // count if count else 0
+
+
+def reset_gpu():
+    event("WATCHDOG: resetting GPU offsets to 0")
+    subprocess.run(["nv-oc", "set", "0", "0"], capture_output=True, timeout=10)
+    # clear saved offsets so they don't re-apply
+    nvoc_path = f"{LAB}/nvoc"
+    if os.path.exists(nvoc_path):
+        with open(nvoc_path, "w") as f:
+            f.write("0 0")
+    applied = "/run/cpu-menu/nvoc-applied"
+    if os.path.exists(applied):
+        os.remove(applied)
+
+
+def reset_cpu_power():
+    event("WATCHDOG: resetting CPU power limit to stock")
+    power_path = f"{LAB}/power"
+    if os.path.exists(power_path):
+        with open(power_path, "w") as f:
+            f.write("off")
+    profile = "/sys/firmware/acpi/platform_profile"
+    if os.path.exists(profile):
+        p = read(profile)
+        with open(profile, "w") as f:
+            f.write(p)
+    else:
+        stock = f"{CONF}/power-stock"
+        if os.path.exists(stock):
+            vals = {}
+            for line in read(stock).splitlines():
+                k, _, v = line.partition("=")
+                vals[k] = v
+            if "STAPM" in vals:
+                subprocess.run(["ryzenadj",
+                                f"--stapm-limit={vals.get('STAPM', '45000')}",
+                                f"--fast-limit={vals.get('FAST', '45000')}",
+                                f"--slow-limit={vals.get('SLOW', '45000')}"],
+                               capture_output=True, timeout=10)
+
+
+XID_SEEN = None
+
+
+def check_xid():
+    """New NVIDIA Xid / bus-drop lines in the kernel log since the last call (log is not cleared)."""
+    global XID_SEEN
+    try:
+        out = subprocess.run(["dmesg"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return None
+    hits = [l.strip() for l in out.splitlines() if "NVRM: Xid" in l or "fallen off the bus" in l]
+    first = XID_SEEN is None
+    new = hits[XID_SEEN:] if not first and len(hits) >= XID_SEEN else ([] if first else hits)
+    XID_SEEN = len(hits)
+    return new[-1] if new else None
+
+
+def main():
+    os.makedirs(LOGDIR, exist_ok=True)
+    os.makedirs("/run/cpu-menu", exist_ok=True)
+
+    nv_pci = find_nv_pci()
+    lim = load_limits()
+    event(f"started: GPU_MAX={lim['GPU_MAX']}  CPU_MAX={lim['CPU_MAX']}  nv={nv_pci is not None}")
+
+    logfile = f"{LOGDIR}/{time.strftime('%Y%m%d-%H%M%S')}.csv"
+    csvfile = open(logfile, "w", newline="")
+    writer = csv.writer(csvfile)
+    writer.writerow(["time", "cpu_temp", "cpu_power_mw", "cpu_avg_mhz", "fan_rpm",
+                      "gpu_temp", "gpu_power_w", "gpu_core_mhz", "gpu_mem_mhz"])
+
+    gpu_hot_count = 0
+    cpu_hot_count = 0
+
+    try:
+        while True:
+            mode = read(f"{CONF}/mode")
+            if mode != "lab":
+                event("lab mode ended, exiting")
+                break
+
+            ct = cpu_temp()
+            cp = cpu_power_mw()
+            cf = cpu_avg_freq() // 1000
+            fr = fan_rpm()
+            nv = nv_temp(nv_pci)
+
+            gt = nv["temp"] if nv else None
+            gp = nv["power"] if nv else None
+            gc = nv["core_clk"] if nv else None
+            gm = nv["mem_clk"] if nv else None
+
+            now = time.strftime("%H:%M:%S")
+            writer.writerow([now, ct, cp, cf, fr, gt, gp, gc, gm])
+            csvfile.flush()
+
+            status = {"time": now, "cpu_temp": ct, "cpu_power_mw": cp, "cpu_freq_mhz": cf,
+                       "fan_rpm": fr, "gpu_temp": gt, "gpu_power_w": gp,
+                       "gpu_core_mhz": gc, "gpu_mem_mhz": gm}
+            tmp = f"{STATUS}.tmp"
+            with open(tmp, "w") as f:
+                json.dump(status, f)
+            os.rename(tmp, STATUS)
+
+            # watchdog: GPU temperature
+            if gt is not None and gt >= lim["GPU_MAX"]:
+                gpu_hot_count += 1
+                if gpu_hot_count >= 2:
+                    event(f"GPU temp {gt}°C >= {lim['GPU_MAX']}°C for 2s")
+                    reset_gpu()
+                    gpu_hot_count = 0
+            else:
+                gpu_hot_count = 0
+
+            # watchdog: CPU temperature
+            if ct is not None and ct >= lim["CPU_MAX"]:
+                cpu_hot_count += 1
+                if cpu_hot_count >= 2:
+                    event(f"CPU temp {ct}°C >= {lim['CPU_MAX']}°C for 2s")
+                    reset_cpu_power()
+                    cpu_hot_count = 0
+            else:
+                cpu_hot_count = 0
+
+            # watchdog: NVIDIA Xid errors
+            xid = check_xid()
+            if xid:
+                event(f"GPU error detected: {xid}")
+                reset_gpu()
+
+            time.sleep(1)
+    finally:
+        csvfile.close()
+        if os.path.exists(STATUS):
+            os.remove(STATUS)
+        event("stopped")
+
+
+if __name__ == "__main__":
+    main()

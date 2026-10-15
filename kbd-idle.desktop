@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Keyboard backlight auto-off
+Comment=Switch the keyboard backlight off after 5 minutes without input
+Exec=/usr/local/bin/kbd-idle 300
+X-GNOME-Autostart-enabled=true
+NoDisplay=true

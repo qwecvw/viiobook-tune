@@ -1,0 +1,10 @@
+[Unit]
+Description=Apply cpu-menu user CPU profile
+After=tlp.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cpu-tune apply
+
+[Install]
+WantedBy=graphical.target
