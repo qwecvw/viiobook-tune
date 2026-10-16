@@ -10,17 +10,22 @@ out=vbios-full-backup.rom
 [ ! -f $out ] || { echo "$out already exists, move it away first"; exit 1; }
 command -v nvflash >/dev/null || { echo "nvflash not installed"; exit 1; }
 
-restart() { systemctl start nvidia-powerd 2>/dev/null || true; systemctl start lightdm 2>/dev/null || true; }
+svcs="hw-lab cpu-fan-guard nvidia-powerd"  # hw-lab and cpu-fan-guard poll the GPU and keep the driver busy
+restart() { for s in $svcs; do systemctl start $s 2>/dev/null || true; done; systemctl start lightdm 2>/dev/null || true; }
+fail() {  # stay on this console so the message can be read
+  echo ""; echo "ERROR: $*"; echo "Nothing was written to the GPU. Return to the desktop: sudo systemctl start lightdm"
+  for s in $svcs; do systemctl start $s 2>/dev/null || true; done; exit 1
+}
 
 echo "Stopping display manager and nvidia-powerd..."
 systemctl stop lightdm 2>/dev/null || true
-systemctl stop nvidia-powerd 2>/dev/null || true
+for s in $svcs; do systemctl stop $s 2>/dev/null || true; done
 sleep 2
 for m in nvidia_uvm nvidia_drm nvidia_modeset nvidia; do modprobe -r $m 2>/dev/null || true; done
 if lsmod | grep -q '^nvidia'; then
-  echo "ERROR: NVIDIA modules still loaded:"; lsmod | grep '^nvidia'
-  fuser -v /dev/nvidia* 2>/dev/null || true
-  restart; exit 1
+  lsmod | grep '^nvidia'
+  fuser -v /dev/nvidia* 2>&1 || true
+  fail "NVIDIA driver still loaded (processes above hold it). Close them and run again."
 fi
 
 echo "Reading EEPROM (1/2)..."
@@ -28,7 +33,7 @@ nvflash --save $out
 echo "Reading EEPROM (2/2, verify)..."
 nvflash --save /tmp/vbios-verify.rom
 if ! cmp -s $out /tmp/vbios-verify.rom; then
-  echo "ERROR: two reads differ, backup not trusted"; rm -f $out /tmp/vbios-verify.rom; restart; exit 1
+  rm -f $out /tmp/vbios-verify.rom; fail "two reads differ, backup not trusted"
 fi
 rm -f /tmp/vbios-verify.rom
 
