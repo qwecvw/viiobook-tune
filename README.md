@@ -55,7 +55,7 @@ sudo ./lab-setup.sh      # для экспериментов: CUDA, gpu-burn, me
 Прошивки (`firmware/`), сторонние инструменты (`tools/`) и RyzenAdj в репозиторий не входят.
 
 Всё по видеокарте, включая гайд по восстановлению после неудачной прошивки, вынесено в отдельный
-репозиторий [rtx-3050m-labs](ssh://git@git.coboto.ru:30909/yura/rtx-3050m-labs.git), см. `docs/RECOVERY.md`.
+репозиторий [rtx-3050m-labs](https://github.com/qwecvw/rtx-3050m-labs), см. [docs/RECOVERY.md](https://github.com/qwecvw/rtx-3050m-labs/blob/main/docs/RECOVERY.md).
 
 ### Результаты на этом ноутбуке
 
