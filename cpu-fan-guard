@@ -41,10 +41,14 @@ nv_sync() { # put the wanted offsets on a freshly woken GPU
   want="0 0"
   if [ $custom = 1 ] && [ -f $pdir/nvoc ]; then want=$(cat $pdir/nvoc); fi
   if [ "$want" != "0 0" ] || [ -f /run/cpu-menu/nvoc-applied ]; then
-    # shellcheck disable=SC2086
-    if nv-oc set $want; then
-      if [ "$want" = "0 0" ]; then rm -f /run/cpu-menu/nvoc-applied; else echo "$want" > /run/cpu-menu/nvoc-applied; fi
-    fi
+    # in the background: if the NVIDIA driver hangs, nv-oc sticks in the kernel for good,
+    # and the fan and power control below must keep running
+    (
+      # shellcheck disable=SC2086
+      if nv-oc set $want; then
+        if [ "$want" = "0 0" ]; then rm -f /run/cpu-menu/nvoc-applied; else echo "$want" > /run/cpu-menu/nvoc-applied; fi
+      fi
+    ) &
   fi
 }
 

@@ -27,6 +27,21 @@ NVCLOCK_FILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "cpu-menu
 NV_STATS_EVERY = 3  # seconds; nvidia-smi only runs while an app already uses the GPU
 
 
+def run_capped(cmd, timeout):
+    """subprocess.run() that really returns on timeout. run() kills the child and then waits for its
+    pipes, and a child stuck in the kernel (hung GPU driver, state D) never dies or closes them."""
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            p.kill()
+        except OSError:
+            pass
+        raise
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+
+
 def read(path, default=""):
     try:
         with open(path) as f:
@@ -180,6 +195,7 @@ class Menu:
         self.amd = find_amdgpu()
         self.nv_stats = ""
         self.nv_polled = 0.0
+        self.nv_polling = False
         self.k10temp = next((f"/sys/class/hwmon/{h}/temp1_input" for h in os.listdir("/sys/class/hwmon")
                              if read(f"/sys/class/hwmon/{h}/name") == "k10temp"), None)
         self.fan = next((f"/sys/class/hwmon/{h}/fan1_input" for h in os.listdir("/sys/class/hwmon")
@@ -242,11 +258,13 @@ class Menu:
 
         def work():
             try:
-                p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                p = run_capped(cmd, timeout)
                 out = (p.stderr or p.stdout).strip().splitlines()
                 self.status = "ok" if p.returncode == 0 else f"error: {out[-1] if out else p.returncode}"
                 if p.returncode == 0 and then:
                     then()
+            except subprocess.TimeoutExpired:
+                self.status = f"error: no answer in {timeout} s (NVIDIA driver hung? reboot)"
             except Exception as e:  # noqa: BLE001
                 self.status = f"error: {e}"
             self.busy = False
@@ -299,20 +317,28 @@ class Menu:
         if now - self.nv_polled < NV_STATS_EVERY:
             return
         self.nv_polled = now
+        if self.nv_polling:  # previous nvidia-smi still stuck: do not pile up more of them
+            return
         if self.nv_state() != "active" or not self.nv_users():
             self.nv_stats = ""
             return
 
         def work():
             try:
-                out = subprocess.run(
+                out = run_capped(
                     ["nvidia-smi", "--query-gpu=pstate,temperature.gpu,power.draw,clocks.gr,utilization.gpu",
-                     "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5).stdout
+                     "--format=csv,noheader,nounits"], 5).stdout
                 ps, temp, watt, clk, util = (x.strip() for x in out.split(","))
                 self.nv_stats = f"{ps}  {temp}°C  {float(watt):.1f} W  {clk} MHz  {util}%"
+                self.nv_polling = False
+            except subprocess.TimeoutExpired:
+                # stays "polling" for good: a stuck nvidia-smi means the driver is hung until reboot
+                self.nv_stats = "driver not responding, reboot"
             except Exception:  # noqa: BLE001
                 self.nv_stats = ""
+                self.nv_polling = False
 
+        self.nv_polling = True
         threading.Thread(target=work, daemon=True).start()
 
     @staticmethod
